@@ -81,8 +81,13 @@ export default {
         return json({ error: "Missing city, country, or locationIds" }, 400, corsHeaders(request));
       }
 
-      if (locationIds.length > 600) {
-        return json({ error: "Too many locations for one request" }, 413, corsHeaders(request));
+      // Safety cap to avoid runaway subrequests (adjust if needed)
+      if (locationIds.length > MAX_LOCATIONS) {
+        return json(
+          { error: `Too many locations for one request (max ${MAX_LOCATIONS})` },
+          413,
+          corsHeaders(request)
+        );
       }
 
       // Cache bucket: 5 minutes
@@ -105,7 +110,7 @@ export default {
 
       const promise = (async () => {
         try {
-          const data = await computeCityAverages(env, locationIds);
+          const data = await computeCityAveragesBatched(env, locationIds);
 
           const resp = json(
             {
@@ -206,6 +211,69 @@ function json(obj, status = 200, headers = {}) {
 // ==== OpenAQ aggregation (Worker-side) ====
 
 const CONCURRENCY = 3;
+const BATCH_SIZE = 200;
+const MAX_LOCATIONS = 2000;
+
+async function computeCityAveragesBatched(env, locationIds) {
+  const chunks = [];
+  for (let i = 0; i < locationIds.length; i += BATCH_SIZE) {
+    chunks.push(locationIds.slice(i, i + BATCH_SIZE));
+  }
+
+  let currentSum = 0;
+  let currentCount = 0;
+  let dailySum = 0;
+  let dailyCount = 0;
+  let annualSum = 0;
+  let annualCount = 0;
+  let latestUpdate = null;
+  let lastYear = new Date().getUTCFullYear() - 1;
+
+  // Process batches sequentially to avoid subrequest spikes
+  for (const chunk of chunks) {
+    const data = await computeCityAverages(env, chunk);
+
+    if (data.currentMean != null && data.currentCount > 0) {
+      currentSum += data.currentMean * data.currentCount;
+      currentCount += data.currentCount;
+    }
+
+    if (data.dailyMean != null && data.dailyCount > 0) {
+      dailySum += data.dailyMean * data.dailyCount;
+      dailyCount += data.dailyCount;
+    }
+
+    if (data.annualMean != null && data.annualCount > 0) {
+      annualSum += data.annualMean * data.annualCount;
+      annualCount += data.annualCount;
+    }
+
+    if (data.updated) {
+      const t = Date.parse(data.updated);
+      if (!isNaN(t)) {
+        if (!latestUpdate || t > latestUpdate) latestUpdate = t;
+      }
+    }
+
+    if (data.lastYear) lastYear = data.lastYear;
+  }
+
+  const currentMean = currentCount ? (currentSum / currentCount) : null;
+  const dailyMean = dailyCount ? (dailySum / dailyCount) : null;
+  const annualMean = annualCount ? (annualSum / annualCount) : null;
+
+  return {
+    currentMean,
+    dailyMean,
+    annualMean,
+    currentCount,
+    dailyCount,
+    annualCount,
+    totalLocations: locationIds.length,
+    updated: latestUpdate ? new Date(latestUpdate).toISOString() : null,
+    lastYear
+  };
+}
 
 async function computeCityAverages(env, locationIds) {
   const sensorResults = await asyncPool(CONCURRENCY, locationIds, async (locId) => {
@@ -887,4 +955,3 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 })();
 </script>
 </body></html>`;
-
