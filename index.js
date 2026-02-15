@@ -22,6 +22,7 @@ export default {
       if (request.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders(request) });
       }
+
       const allowedMethods = new Set(["GET", "HEAD"]);
       if (!allowedMethods.has(request.method)) {
         return json({ error: "Method not allowed" }, 405, corsHeaders(request));
@@ -75,9 +76,8 @@ function json(obj, status = 200, headers = {}) {
   });
 }
 
-// === Your HTML ===
-// IMPORTANT: In the HTML below, replace API_BASE with your Worker URL.
-// Example: const API_BASE = "https://equivalent-cigarettes.neeraj-kumar0682.workers.dev";
+// === HTML ===
+// Uses same-origin Worker for API calls (no key in browser)
 const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-behavior" content="local_only"><meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://code.jquery.com https://unpkg.com https://d3js.org https://threejs.org https://cdn.plot.ly https://stackpath.bootstrapcdn.com https://maps.googleapis.com https://cdn.tailwindcss.com https://ajax.googleapis.com https://kit.fontawesome.com https://cdn.datatables.net https://maxcdn.bootstrapcdn.com https://code.highcharts.com https://tako-static-assets-production.s3.amazonaws.com https://www.youtube.com https://fonts.googleapis.com https://fonts.gstatic.com https://pfst.cf2.poecdn.net https://puc.poecdn.net https://i.imgur.com https://wikimedia.org https://*.icons8.com https://*.giphy.com https://picsum.photos https://images.unsplash.com; frame-src 'self' https://www.youtube.com https://trytako.com; child-src 'self'; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests; block-all-mixed-content;">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -108,9 +108,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     margin: 0 auto;
     padding: 32px 20px 64px;
   }
-  header {
-    margin: 16px 0 28px;
-  }
+  header { margin: 16px 0 28px; }
   h1 {
     margin: 0 0 8px;
     font-size: clamp(28px, 4vw, 44px);
@@ -136,14 +134,10 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     gap: 12px;
   }
   @media (max-width: 720px) {
-    .search {
-      grid-template-columns: 1fr;
-    }
+    .search { grid-template-columns: 1fr; }
   }
 
-  .field {
-    position: relative;
-  }
+  .field { position: relative; }
   label {
     display: block;
     font-size: 12px;
@@ -212,20 +206,14 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
   .option:hover { background: #11182a; }
   .option small { color: var(--muted); }
 
-  .results {
-    margin-top: 20px;
-    display: grid;
-    gap: 14px;
-  }
+  .results { margin-top: 20px; display: grid; gap: 14px; }
   .stats {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 14px;
   }
   @media (max-width: 720px) {
-    .stats {
-      grid-template-columns: 1fr;
-    }
+    .stats { grid-template-columns: 1fr; }
   }
   .stat {
     background: #0c1220;
@@ -233,40 +221,22 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     border-radius: 12px;
     padding: 16px;
   }
-  .stat h3 {
-    margin: 0 0 8px;
-    font-size: 14px;
-    color: var(--muted);
-  }
+  .stat h3 { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
   .value {
     font-size: clamp(28px, 4vw, 40px);
     font-weight: 700;
     letter-spacing: -0.02em;
   }
-  .unit {
-    font-size: 12px;
-    color: var(--muted);
-    margin-left: 6px;
-  }
-  .cig {
-    margin-top: 8px;
-    font-size: 14px;
-    color: var(--muted);
-  }
+  .unit { font-size: 12px; color: var(--muted); margin-left: 6px; }
+  .cig { margin-top: 8px; font-size: 14px; color: var(--muted); }
 
-  .fade-in {
-    animation: fadeInUp 0.5s ease both;
-  }
+  .fade-in { animation: fadeInUp 0.5s ease both; }
   @keyframes fadeInUp {
     from { opacity: 0; transform: translateY(8px); }
     to { opacity: 1; transform: translateY(0); }
   }
 
-  .loading {
-    position: relative;
-    overflow: hidden;
-    color: transparent;
-  }
+  .loading { position: relative; overflow: hidden; color: transparent; }
   .loading::after {
     content: "";
     position: absolute;
@@ -275,24 +245,11 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     transform: translateX(-100%);
     animation: shimmer 1.2s infinite;
   }
-  @keyframes shimmer {
-    100% { transform: translateX(100%); }
-  }
+  @keyframes shimmer { 100% { transform: translateX(100%); } }
 
-  .meta {
-    font-size: 12px;
-    color: var(--muted);
-  }
-  .error {
-    color: #fca5a5;
-    font-size: 13px;
-  }
-
-  .footer {
-    margin-top: 18px;
-    font-size: 12px;
-    color: var(--muted);
-  }
+  .meta { font-size: 12px; color: var(--muted); }
+  .error { color: #fca5a5; font-size: 13px; }
+  .footer { margin-top: 18px; font-size: 12px; color: var(--muted); }
 
   @media (prefers-reduced-motion: reduce) {
     .fade-in { animation: none; }
@@ -358,10 +315,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 
 <script>
 (() => {
-  const API_BASE = "https://equivalent-cigarettes.neeraj-kumar0682.workers.dev";
-
-  // Remove obfuscated key when using Worker proxy
-  const API_KEY = "";
+  const API_BASE = location.origin; // same Worker origin
 
   const els = {
     form: document.getElementById("searchForm"),
@@ -379,32 +333,14 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     annualCigs: document.getElementById("annualCigs"),
   };
 
-  const state = {
-    matches: [],
-    nextPage: 1,
-    query: "",
-    iso: "",
-    searching: false
-  };
+  const state = { matches: [], nextPage: 1, query: "", iso: "", searching: false };
 
-  function setError(msg) {
-    els.errorBox.textContent = msg || "";
-  }
-
-  function setMeta(msg) {
-    els.searchMeta.textContent = msg || "";
-  }
-
-  function normalize(s) {
-    return (s || "").toLowerCase();
-  }
+  function setError(msg) { els.errorBox.textContent = msg || ""; }
+  function setMeta(msg) { els.searchMeta.textContent = msg || ""; }
+  function normalize(s) { return (s || "").toLowerCase(); }
 
   async function fetchJson(url) {
-    const res = await fetch(url, {
-      headers: {
-        "accept": "application/json"
-      }
-    });
+    const res = await fetch(url, { headers: { "accept": "application/json" } });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(\`API \${res.status}: \${text || res.statusText}\`);
@@ -414,10 +350,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 
   function renderDropdown() {
     const list = state.matches;
-    if (!list.length) {
-      els.dropdown.style.display = "none";
-      return;
-    }
+    if (!list.length) { els.dropdown.style.display = "none"; return; }
     els.dropdown.innerHTML = list.map((loc, idx) => {
       const name = loc.name || "Unnamed location";
       const locality = loc.locality || "";
@@ -444,10 +377,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     setError("");
     const q = state.query.trim();
     const iso = state.iso.trim().toUpperCase();
-    if (!q) {
-      state.searching = false;
-      return;
-    }
+    if (!q) { state.searching = false; return; }
 
     if (initial) {
       state.matches = [];
@@ -461,26 +391,17 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     let pagesFetched = 0;
 
     while (pagesFetched < maxAutoPages) {
-      const params = new URLSearchParams({
-        limit: "100",
-        page: String(page)
-      });
+      const params = new URLSearchParams({ limit: "100", page: String(page) });
       if (iso) params.set("iso", iso);
 
       const url = \`\${API_BASE}/v3/locations?\${params}\`;
       let data;
-      try {
-        data = await fetchJson(url);
-      } catch (e) {
-        setError(e.message);
-        break;
-      }
+      try { data = await fetchJson(url); }
+      catch (e) { setError(e.message); break; }
 
       const results = Array.isArray(data.results) ? data.results : [];
       const matches = results.filter(loc => {
-        const hay = normalize(
-          [loc.name, loc.locality, loc.country?.name, loc.country?.code].join(" ")
-        );
+        const hay = normalize([loc.name, loc.locality, loc.country?.name, loc.country?.code].join(" "));
         return hay.includes(normalize(q));
       });
 
@@ -488,9 +409,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
       page += 1;
       pagesFetched += 1;
 
-      if (state.matches.length >= 10 || results.length === 0) {
-        break;
-      }
+      if (state.matches.length >= 10 || results.length === 0) break;
     }
 
     state.nextPage = page;
@@ -525,9 +444,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
         return pname === "pm25" || dname.includes("pm2.5");
       });
 
-      if (!pmSensors.length) {
-        throw new Error("No PM2.5 sensors found for this location.");
-      }
+      if (!pmSensors.length) throw new Error("No PM2.5 sensors found for this location.");
 
       let sensor = pmSensors.find(s => s.latest && s.latest.value != null) || pmSensors[0];
 
@@ -552,9 +469,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
           return String(from).startsWith("2025") || String(to).startsWith("2025");
         }) || annualResults[0];
 
-        if (pick) {
-          annualValue = pick.value ?? pick.summary?.avg ?? null;
-        }
+        if (pick) annualValue = pick.value ?? pick.summary?.avg ?? null;
       } catch (e) {
         annualValue = null;
       }
@@ -582,34 +497,18 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     const cCigs = (current != null) ? Math.round(current / 22) : null;
     const aCigs = (annual != null) ? Math.round(annual / 22) : null;
 
-    els.currentCigs.textContent = cCigs != null
-      ? \`≈ \${cCigs} cigarettes/day\`
-      : "≈ N/A cigarettes/day";
-    els.annualCigs.textContent = aCigs != null
-      ? \`≈ \${aCigs} cigarettes/day\`
-      : "≈ N/A cigarettes/day";
+    els.currentCigs.textContent = cCigs != null ? \`≈ \${cCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
+    els.annualCigs.textContent = aCigs != null ? \`≈ \${aCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
 
-    if (updated) {
-      els.locationMeta.textContent = \`\${els.locationMeta.textContent} • Updated \${updated}\`;
-    }
+    if (updated) els.locationMeta.textContent = \`\${els.locationMeta.textContent} • Updated \${updated}\`;
   }
 
   function animateNumber(el, value, unit) {
     const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (value == null || isNaN(value)) {
-      el.textContent = "N/A";
-      return;
-    }
+    if (value == null || isNaN(value)) { el.textContent = "N/A"; return; }
     const target = Math.round(value);
-    if (prefersReduced) {
-      el.textContent = \`\${target}\`;
-      if (unit) el.innerHTML = \`\${target}<span class="unit">\${unit}</span>\`;
-      return;
-    }
-    const start = 0;
-    const duration = 700;
-    const startTime = performance.now();
-
+    if (prefersReduced) { el.innerHTML = \`\${target}<span class="unit">\${unit}</span>\`; return; }
+    const start = 0, duration = 700, startTime = performance.now();
     function tick(now) {
       const t = Math.min(1, (now - startTime) / duration);
       const eased = 1 - Math.pow(1 - t, 3);
