@@ -81,7 +81,7 @@ export default {
         return json({ error: "Missing city, country, or locationIds" }, 400, corsHeaders(request));
       }
 
-      if (locationIds.length > 200) {
+      if (locationIds.length > 600) {
         return json({ error: "Too many locations for one request" }, 413, corsHeaders(request));
       }
 
@@ -887,3 +887,4 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 })();
 </script>
 </body></html>`;
+
