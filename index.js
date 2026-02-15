@@ -12,6 +12,45 @@ export default {
       });
     }
 
+    // Serve cities.json (from env)
+    if (url.pathname === "/cities.json") {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(request) });
+      }
+
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return json({ error: "Method not allowed" }, 405, corsHeaders(request));
+      }
+
+      if (env.CITIES_JSON && env.CITIES_JSON.length > 0) {
+        return new Response(env.CITIES_JSON, {
+          status: 200,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "public, max-age=3600",
+            ...corsHeaders(request)
+          }
+        });
+      }
+
+      if (env.CITIES_JSON_URL && env.CITIES_JSON_URL.length > 0) {
+        const upstream = await fetch(env.CITIES_JSON_URL, {
+          headers: { "accept": "application/json" }
+        });
+        const body = await upstream.text();
+        return new Response(body, {
+          status: upstream.status,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "public, max-age=3600",
+            ...corsHeaders(request)
+          }
+        });
+      }
+
+      return json({ error: "CITIES_JSON not configured" }, 404, corsHeaders(request));
+    }
+
     // Health check
     if (url.pathname === "/health") {
       return json({ ok: true }, 200, corsHeaders(request));
@@ -192,32 +231,19 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     z-index: 10;
     box-shadow: 0 10px 25px rgba(0,0,0,0.35);
   }
-  .group { border-bottom: 1px solid #141b2b; }
-  .group:last-child { border-bottom: none; }
-  .group-header {
+  .dropdown-item {
     padding: 10px 12px;
     cursor: pointer;
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    font-weight: 600;
-    background: #11182a;
-  }
-  .group-header:hover { background: #141d31; }
-  .group-list { padding: 6px 12px 10px; }
-  .location-item {
-    padding: 6px 0;
-    font-size: 13px;
-    color: var(--muted);
     border-bottom: 1px dashed #1b2436;
+    font-size: 14px;
   }
-  .location-item:last-child { border-bottom: none; }
-  .group-header small { color: var(--muted); font-weight: 500; }
+  .dropdown-item:last-child { border-bottom: none; }
+  .dropdown-item:hover { background: #141d31; }
 
   .results { margin-top: 20px; display: grid; gap: 14px; }
   .stats {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, 1fr);
     gap: 14px;
   }
   @media (max-width: 720px) {
@@ -271,7 +297,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     <header>
       <h1>Air you breathe, translated into cigarettes.</h1>
       <div class="subtitle">
-        Type a city, pick the city group, and see the average PM2.5 across its monitoring locations.
+        Type a city, pick the city, and see the average PM2.5 across its monitoring locations.
       </div>
     </header>
 
@@ -281,7 +307,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
           <label for="cityInput">City name</label>
           <input id="cityInput" type="text" placeholder="e.g., London" required="">
           <div id="dropdown" class="dropdown" style="display:none;"></div>
-          <div class="hint">Live search (debounced). City is parsed from location name (after first comma).</div>
+          <div class="hint">Live search from cities.json. Pick a city to compute averages.</div>
         </div>
         <div class="field">
           <label for="isoInput">Country ISO (optional)</label>
@@ -307,7 +333,13 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
             <div class="count" id="currentCount"></div>
           </div>
           <div class="stat">
-            <h3>Average PM2.5 (2025)</h3>
+            <h3>Average PM2.5 (last 24 hours)</h3>
+            <div class="value" id="dailyValue">—</div>
+            <div class="cig" id="dailyCigs">—</div>
+            <div class="count" id="dailyCount"></div>
+          </div>
+          <div class="stat">
+            <h3 id="annualLabel">Average PM2.5 (last year)</h3>
             <div class="value" id="annualValue">—</div>
             <div class="cig" id="annualCigs">—</div>
             <div class="count" id="annualCount"></div>
@@ -327,6 +359,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 <script>
 (() => {
   const API_BASE = location.origin; // same Worker origin
+  const CITIES_URL = "/cities.json";
 
   const els = {
     form: document.getElementById("searchForm"),
@@ -340,16 +373,27 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     locationMeta: document.getElementById("locationMeta"),
     currentValue: document.getElementById("currentValue"),
     currentCigs: document.getElementById("currentCigs"),
+    dailyValue: document.getElementById("dailyValue"),
+    dailyCigs: document.getElementById("dailyCigs"),
     annualValue: document.getElementById("annualValue"),
     annualCigs: document.getElementById("annualCigs"),
     currentCount: document.getElementById("currentCount"),
+    dailyCount: document.getElementById("dailyCount"),
     annualCount: document.getElementById("annualCount"),
+    annualLabel: document.getElementById("annualLabel")
   };
 
-  const MAX_LOCATIONS = 20;
   const CONCURRENCY = 5;
 
-  const state = { matches: [], groups: [], nextPage: 1, query: "", iso: "", searching: false, debounceId: null };
+  const state = {
+    cities: [],
+    filtered: [],
+    query: "",
+    iso: "",
+    searching: false,
+    debounceId: null,
+    citiesReady: false
+  };
 
   function setError(msg) { els.errorBox.textContent = msg || ""; }
   function setMeta(msg) { els.searchMeta.textContent = msg || ""; }
@@ -364,56 +408,58 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     return res.json();
   }
 
-  // City is ONLY the substring after the first comma in location.name
-  function parseCityFromName(name) {
-    if (!name) return "";
-    const parts = String(name).split(",");
-    if (parts.length >= 2) return parts[1].trim();
-    return "";
-  }
-
-  function matchLocation(loc, q) {
-    const query = normalize(q);
-    const parsedCity = normalize(parseCityFromName(loc.name || ""));
-    if (!parsedCity) return false;
-    return parsedCity.includes(query);
-  }
-
-  function cityKeyForLocation(loc) {
-    return (parseCityFromName(loc.name) || "Unknown").trim();
-  }
-
-  function buildGroups(locations) {
-    const map = new Map();
-    for (const loc of locations) {
-      const city = cityKeyForLocation(loc);
-      if (!map.has(city)) map.set(city, []);
-      map.get(city).push(loc);
+  async function loadCities() {
+    try {
+      setMeta("Loading city list…");
+      const data = await fetchJson(CITIES_URL);
+      const cities = Array.isArray(data.cities) ? data.cities : [];
+      state.cities = cities;
+      state.citiesReady = true;
+      setMeta(\`Loaded \${cities.length} cities.\`);
+    } catch (e) {
+      setError("Failed to load cities.json. Check Worker env configuration.");
+      setMeta("");
+      state.citiesReady = false;
     }
-    const groups = Array.from(map.entries()).map(([city, locations]) => ({ city, locations }));
-    groups.sort((a, b) => b.locations.length - a.locations.length || a.city.localeCompare(b.city));
-    return groups;
+  }
+
+  function filterCities() {
+    const q = normalize(state.query.trim());
+    const iso = normalize(state.iso.trim());
+
+    if (!q || q.length < 2) {
+      state.filtered = [];
+      renderDropdown();
+      setMeta("Type at least 2 characters.");
+      return;
+    }
+
+    let list = state.cities.filter(c => normalize(c.city).includes(q));
+    if (iso) {
+      list = list.filter(c => normalize(c.country_code) === iso);
+    }
+
+    // Limit dropdown to 50 entries for UX
+    state.filtered = list.slice(0, 50);
+
+    if (state.filtered.length) {
+      setMeta(\`Found \${list.length} cities. Click one to compute averages.\`);
+    } else {
+      setMeta("No matches found. Try a more specific name or add country ISO.");
+    }
+
+    renderDropdown();
   }
 
   function renderDropdown() {
-    const groups = state.groups;
-    if (!groups.length) { els.dropdown.style.display = "none"; return; }
-    els.dropdown.innerHTML = groups.map((g, gi) => {
-      const locItems = g.locations.map(loc => {
-        const name = loc.name || "Unnamed location";
-        const country = loc.country?.code || loc.country?.name || "";
-        const subtitle = country ? \` • \${country}\` : "";
-        return \`<div class="location-item">\${escapeHtml(name)}\${subtitle ? \` <small>\${escapeHtml(subtitle)}</small>\` : ""}</div>\`;
-      }).join("");
-      return \`
-        <div class="group">
-          <div class="group-header" data-group="\${gi}">
-            <div>\${escapeHtml(g.city)} <small>• \${g.locations.length} locations</small></div>
-          </div>
-          <div class="group-list">\${locItems}</div>
-        </div>
-      \`;
+    const items = state.filtered;
+    if (!items.length) { els.dropdown.style.display = "none"; return; }
+
+    els.dropdown.innerHTML = items.map((c, i) => {
+      const label = \`\${c.city}, \${c.country}\`;
+      return \`<div class="dropdown-item" data-idx="\${i}">\${escapeHtml(label)}</div>\`;
     }).join("");
+
     els.dropdown.style.display = "block";
   }
 
@@ -423,71 +469,13 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     }[c]));
   }
 
-  async function searchLocations(initial = true) {
-    if (state.searching) return;
-    state.searching = true;
-    setError("");
-    const q = state.query.trim();
-    const iso = state.iso.trim().toUpperCase();
-    if (!q || q.length < 2) {
-      setMeta("Type at least 2 characters.");
-      state.groups = [];
-      renderDropdown();
-      state.searching = false;
-      return;
-    }
-
-    if (initial) {
-      state.matches = [];
-      state.nextPage = 1;
-      setMeta("Searching locations…");
-      els.dropdown.style.display = "none";
-    }
-
-    const maxAutoPages = 3;
-    let page = state.nextPage;
-    let pagesFetched = 0;
-
-    while (pagesFetched < maxAutoPages) {
-      const params = new URLSearchParams({ limit: "100", page: String(page) });
-      if (iso) params.set("iso", iso);
-
-      const url = \`\${API_BASE}/v3/locations?\${params}\`;
-      let data;
-      try { data = await fetchJson(url); }
-      catch (e) { setError(e.message); break; }
-
-      const results = Array.isArray(data.results) ? data.results : [];
-      const matches = results.filter(loc => matchLocation(loc, q));
-
-      state.matches = state.matches.concat(matches);
-      page += 1;
-      pagesFetched += 1;
-
-      if (state.matches.length >= 40 || results.length === 0) break;
-    }
-
-    state.nextPage = page;
-    state.groups = buildGroups(state.matches);
-
-    if (state.groups.length) {
-      setMeta(\`Found \${state.groups.length} cities. Click a city to compute averages.\`);
-      renderDropdown();
-    } else {
-      setMeta("No matches found in the first pages. Try a more specific name or add country ISO.");
-      renderDropdown();
-    }
-
-    state.searching = false;
-  }
-
   function debounceSearch() {
     clearTimeout(state.debounceId);
     state.debounceId = setTimeout(() => {
       state.query = els.city.value;
       state.iso = els.iso.value;
-      searchLocations(true);
-    }, 400);
+      if (state.citiesReady) filterCities();
+    }, 250);
   }
 
   async function asyncPool(limit, items, iterator) {
@@ -524,19 +512,54 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     return withLatest[0];
   }
 
-  async function computeCityAverages(group) {
+  async function fetchLast24hMean(sensorId) {
+    const now = new Date();
+    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const params = new URLSearchParams({
+      date_from: from.toISOString(),
+      date_to: now.toISOString(),
+      limit: "1000",
+      sort: "desc"
+    });
+    const url = \`\${API_BASE}/v3/sensors/\${sensorId}/measurements?\${params}\`;
+    const data = await fetchJson(url);
+    const results = Array.isArray(data.results) ? data.results : [];
+    if (!results.length) return null;
+
+    const values = results.map(r => r.value).filter(v => v != null && !isNaN(v));
+    if (!values.length) return null;
+
+    return values.reduce((s, v) => s + v, 0) / values.length;
+  }
+
+  async function fetchLastYearMean(sensorId, year) {
+    const params = new URLSearchParams({
+      date_from: \`\${year}-01-01\`,
+      date_to: \`\${year}-12-31\`,
+      limit: "100"
+    });
+    const url = \`\${API_BASE}/v3/sensors/\${sensorId}/years?\${params}\`;
+    const data = await fetchJson(url);
+    const list = Array.isArray(data.results) ? data.results : [];
+    const pick = list.find(x => {
+      const from = x.period?.datetimeFrom?.utc || x.period?.datetimeFrom?.local || "";
+      const to = x.period?.datetimeTo?.utc || x.period?.datetimeTo?.local || "";
+      return String(from).startsWith(String(year)) || String(to).startsWith(String(year));
+    }) || list[0];
+    const val = pick?.value ?? pick?.summary?.avg ?? null;
+    return val != null ? val : null;
+  }
+
+  async function computeCityAverages(cityObj) {
     setError("");
     els.results.style.display = "block";
     setLoading(true);
 
-    const totalLocations = group.locations.length;
-    const locations = group.locations.slice(0, MAX_LOCATIONS);
-    const capped = totalLocations > MAX_LOCATIONS;
-
-    els.locationMeta.textContent = \`City: \${group.city} • Loading \${locations.length}\${capped ? \` (cap \${MAX_LOCATIONS})\` : ""} locations…\`;
+    const totalLocations = cityObj.locations.length;
+    els.locationMeta.textContent = \`City: \${cityObj.city}, \${cityObj.country} • Loading \${totalLocations} locations…\`;
 
     try {
-      const sensorResults = await asyncPool(CONCURRENCY, locations, async (loc) => {
+      const sensorResults = await asyncPool(CONCURRENCY, cityObj.locations, async (loc) => {
         const sensorsUrl = \`\${API_BASE}/v3/locations/\${loc.id}/sensors?limit=200\`;
         const sensorsData = await fetchJson(sensorsUrl);
         const sensors = Array.isArray(sensorsData.results) ? sensorsData.results : [];
@@ -561,46 +584,53 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
         }
       }
 
-      const annualResults = await asyncPool(CONCURRENCY, used, async (r) => {
+      const dailyResults = await asyncPool(CONCURRENCY, used, async (r) => {
         try {
-          const annualUrl = \`\${API_BASE}/v3/sensors/\${r.sensor.id}/years?date_from=2025-01-01&date_to=2025-12-31&limit=100\`;
-          const annualData = await fetchJson(annualUrl);
-          const annualList = Array.isArray(annualData.results) ? annualData.results : [];
-          const pick = annualList.find(x => {
-            const from = x.period?.datetimeFrom?.utc || x.period?.datetimeFrom?.local || "";
-            const to = x.period?.datetimeTo?.utc || x.period?.datetimeTo?.local || "";
-            return String(from).startsWith("2025") || String(to).startsWith("2025");
-          }) || annualList[0];
-          const val = pick?.value ?? pick?.summary?.avg ?? null;
-          return val != null ? val : null;
+          return await fetchLast24hMean(r.sensor.id);
         } catch (e) {
           return null;
         }
       });
+      const dailyUsed = dailyResults.filter(v => v != null);
+      const dailyMean = dailyUsed.length ? (dailyUsed.reduce((s, v) => s + v, 0) / dailyUsed.length) : null;
 
+      const lastYear = new Date().getUTCFullYear() - 1;
+      els.annualLabel.textContent = \`Average PM2.5 (\${lastYear})\`;
+
+      const annualResults = await asyncPool(CONCURRENCY, used, async (r) => {
+        try {
+          return await fetchLastYearMean(r.sensor.id, lastYear);
+        } catch (e) {
+          return null;
+        }
+      });
       const annualUsed = annualResults.filter(v => v != null);
       const annualMean = annualUsed.length ? (annualUsed.reduce((s, v) => s + v, 0) / annualUsed.length) : null;
 
       renderValues({
-        city: group.city,
+        city: cityObj.city,
+        country: cityObj.country,
         currentMean,
+        dailyMean,
         annualMean,
         currentCount: used.length,
+        dailyCount: dailyUsed.length,
         annualCount: annualUsed.length,
         totalLocations,
-        capped,
         updated: latestUpdate ? new Date(latestUpdate).toISOString() : null
       });
     } catch (e) {
       setError(e.message);
       renderValues({
-        city: group.city,
+        city: cityObj.city,
+        country: cityObj.country,
         currentMean: null,
+        dailyMean: null,
         annualMean: null,
         currentCount: 0,
+        dailyCount: 0,
         annualCount: 0,
         totalLocations,
-        capped,
         updated: null
       });
     } finally {
@@ -609,26 +639,30 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
   }
 
   function setLoading(isLoading) {
-    [els.currentValue, els.annualValue, els.currentCigs, els.annualCigs].forEach(el => {
+    [els.currentValue, els.dailyValue, els.annualValue, els.currentCigs, els.dailyCigs, els.annualCigs].forEach(el => {
       if (isLoading) el.classList.add("loading");
       else el.classList.remove("loading");
     });
   }
 
-  function renderValues({ city, currentMean, annualMean, currentCount, annualCount, totalLocations, capped, updated }) {
+  function renderValues({ city, country, currentMean, dailyMean, annualMean, currentCount, dailyCount, annualCount, totalLocations, updated }) {
     animateNumber(els.currentValue, currentMean, "µg/m³");
+    animateNumber(els.dailyValue, dailyMean, "µg/m³");
     animateNumber(els.annualValue, annualMean, "µg/m³");
 
     const cCigs = (currentMean != null) ? Math.round(currentMean / 22) : null;
+    const dCigs = (dailyMean != null) ? Math.round(dailyMean / 22) : null;
     const aCigs = (annualMean != null) ? Math.round(annualMean / 22) : null;
 
     els.currentCigs.textContent = cCigs != null ? \`≈ \${cCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
+    els.dailyCigs.textContent = dCigs != null ? \`≈ \${dCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
     els.annualCigs.textContent = aCigs != null ? \`≈ \${aCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
 
-    els.currentCount.textContent = \`\${currentCount} of \${totalLocations} locations used\${capped ? \` (cap \${MAX_LOCATIONS})\` : ""}\`;
-    els.annualCount.textContent = annualCount ? \`\${annualCount} locations with 2025 data\` : "No 2025 data available";
+    els.currentCount.textContent = \`\${currentCount} of \${totalLocations} locations used\`;
+    els.dailyCount.textContent = dailyCount ? \`\${dailyCount} locations with 24h data\` : "No 24h data available";
+    els.annualCount.textContent = annualCount ? \`\${annualCount} locations with last-year data\` : "No last-year data available";
 
-    let meta = \`City: \${city} • Locations used: \${currentCount}/\${totalLocations}\${capped ? \` (cap \${MAX_LOCATIONS})\` : ""}\`;
+    let meta = \`City: \${city}, \${country} • Locations used: \${currentCount}/\${totalLocations}\`;
     if (updated) meta += \` • Latest update \${updated}\`;
     els.locationMeta.textContent = meta;
   }
@@ -658,18 +692,19 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     e.preventDefault();
     state.query = els.city.value;
     state.iso = els.iso.value;
-    searchLocations(true);
+    if (state.citiesReady) filterCities();
   });
 
-  // Click city group header to compute averages
+  // Click dropdown item to compute averages
   els.dropdown.addEventListener("click", (e) => {
-    const header = e.target.closest(".group-header");
-    if (!header) return;
-    const idx = Number(header.dataset.group);
-    const group = state.groups[idx];
-    if (!group) return;
+    const item = e.target.closest(".dropdown-item");
+    if (!item) return;
+    const idx = Number(item.dataset.idx);
+    const cityObj = state.filtered[idx];
+    if (!cityObj) return;
     els.dropdown.style.display = "none";
-    computeCityAverages(group);
+    els.city.value = \`\${cityObj.city}, \${cityObj.country}\`;
+    computeCityAverages(cityObj);
   });
 
   document.addEventListener("click", (e) => {
@@ -677,6 +712,9 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
       els.dropdown.style.display = "none";
     }
   });
+
+  // Init
+  loadCities();
 })();
 </script>
 </body></html>`;
