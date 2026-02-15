@@ -189,22 +189,32 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     background: #0c1220;
     border: 1px solid var(--border);
     border-radius: 10px;
-    max-height: 260px;
+    max-height: 320px;
     overflow: auto;
     z-index: 10;
     box-shadow: 0 10px 25px rgba(0,0,0,0.35);
   }
-  .option {
+  .group { border-bottom: 1px solid #141b2b; }
+  .group:last-child { border-bottom: none; }
+  .group-header {
     padding: 10px 12px;
     cursor: pointer;
-    border-bottom: 1px solid #141b2b;
     display: flex;
     justify-content: space-between;
     gap: 8px;
+    font-weight: 600;
+    background: #11182a;
   }
-  .option:last-child { border-bottom: none; }
-  .option:hover { background: #11182a; }
-  .option small { color: var(--muted); }
+  .group-header:hover { background: #141d31; }
+  .group-list { padding: 6px 12px 10px; }
+  .location-item {
+    padding: 6px 0;
+    font-size: 13px;
+    color: var(--muted);
+    border-bottom: 1px dashed #1b2436;
+  }
+  .location-item:last-child { border-bottom: none; }
+  .group-header small { color: var(--muted); font-weight: 500; }
 
   .results { margin-top: 20px; display: grid; gap: 14px; }
   .stats {
@@ -229,6 +239,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
   }
   .unit { font-size: 12px; color: var(--muted); margin-left: 6px; }
   .cig { margin-top: 8px; font-size: 14px; color: var(--muted); }
+  .count { margin-top: 6px; font-size: 12px; color: var(--muted); }
 
   .fade-in { animation: fadeInUp 0.5s ease both; }
   @keyframes fadeInUp {
@@ -262,7 +273,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     <header>
       <h1>Air you breathe, translated into cigarettes.</h1>
       <div class="subtitle">
-        Search a city, pick a monitoring location, and see current and 2025 PM2.5 levels.
+        Type a city, pick the city group, and see the average PM2.5 across its monitoring locations.
       </div>
     </header>
 
@@ -272,7 +283,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
           <label for="cityInput">City name</label>
           <input id="cityInput" type="text" placeholder="e.g., London" required="">
           <div id="dropdown" class="dropdown" style="display:none;"></div>
-          <div class="hint">Matches location name or locality within the first few result pages.</div>
+          <div class="hint">Live search (debounced). Click a city to compute averages. Locations listed under each city.</div>
         </div>
         <div class="field">
           <label for="isoInput">Country ISO (optional)</label>
@@ -292,14 +303,16 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
         <div class="meta" id="locationMeta"></div>
         <div class="stats" style="margin-top:12px;">
           <div class="stat">
-            <h3>Current PM2.5</h3>
+            <h3>Average PM2.5 (latest)</h3>
             <div class="value" id="currentValue">—</div>
             <div class="cig" id="currentCigs">—</div>
+            <div class="count" id="currentCount"></div>
           </div>
           <div class="stat">
             <h3>Average PM2.5 (2025)</h3>
             <div class="value" id="annualValue">—</div>
             <div class="cig" id="annualCigs">—</div>
+            <div class="count" id="annualCount"></div>
           </div>
         </div>
         <div class="footer">
@@ -308,7 +321,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
       </div>
 
       <div class="meta" id="disclaimer">
-        PM2.5 levels vary by location and time. This estimate is a simplified equivalence for context only.
+        PM2.5 levels vary by location and time. City averages use the latest sensor values per location.
       </div>
     </div>
   </div>
@@ -331,9 +344,14 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     currentCigs: document.getElementById("currentCigs"),
     annualValue: document.getElementById("annualValue"),
     annualCigs: document.getElementById("annualCigs"),
+    currentCount: document.getElementById("currentCount"),
+    annualCount: document.getElementById("annualCount"),
   };
 
-  const state = { matches: [], nextPage: 1, query: "", iso: "", searching: false };
+  const MAX_LOCATIONS = 20;
+  const CONCURRENCY = 5;
+
+  const state = { matches: [], groups: [], nextPage: 1, query: "", iso: "", searching: false, debounceId: null };
 
   function setError(msg) { els.errorBox.textContent = msg || ""; }
   function setMeta(msg) { els.searchMeta.textContent = msg || ""; }
@@ -348,17 +366,55 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     return res.json();
   }
 
+  function parseCityFromName(name) {
+    if (!name) return "";
+    const parts = String(name).split(",");
+    if (parts.length >= 2) return parts[1].trim();
+    return "";
+  }
+
+  function matchLocation(loc, q) {
+    const query = normalize(q);
+    const locality = normalize(loc.locality || "");
+    const name = normalize(loc.name || "");
+    const parsedCity = normalize(parseCityFromName(loc.name || ""));
+    if (locality) return locality.includes(query);
+    return name.includes(query) || parsedCity.includes(query);
+  }
+
+  function cityKeyForLocation(loc) {
+    return (loc.locality || parseCityFromName(loc.name) || "Unknown").trim();
+  }
+
+  function buildGroups(locations) {
+    const map = new Map();
+    for (const loc of locations) {
+      const city = cityKeyForLocation(loc);
+      if (!map.has(city)) map.set(city, []);
+      map.get(city).push(loc);
+    }
+    const groups = Array.from(map.entries()).map(([city, locations]) => ({ city, locations }));
+    groups.sort((a, b) => b.locations.length - a.locations.length || a.city.localeCompare(b.city));
+    return groups;
+  }
+
   function renderDropdown() {
-    const list = state.matches;
-    if (!list.length) { els.dropdown.style.display = "none"; return; }
-    els.dropdown.innerHTML = list.map((loc, idx) => {
-      const name = loc.name || "Unnamed location";
-      const locality = loc.locality || "";
-      const country = loc.country?.code || loc.country?.name || "";
-      const subtitle = [locality, country].filter(Boolean).join(", ");
+    const groups = state.groups;
+    if (!groups.length) { els.dropdown.style.display = "none"; return; }
+    els.dropdown.innerHTML = groups.map((g, gi) => {
+      const locItems = g.locations.map(loc => {
+        const name = loc.name || "Unnamed location";
+        const locality = loc.locality || "";
+        const country = loc.country?.code || loc.country?.name || "";
+        const subtitle = [locality, country].filter(Boolean).join(", ");
+        return \`<div class="location-item">\${escapeHtml(name)}\${subtitle ? \` <small>• \${escapeHtml(subtitle)}</small>\` : ""}</div>\`;
+      }).join("");
       return \`
-        <div class="option" data-idx="\${idx}" role="option">
-          <div>\${escapeHtml(name)} \${subtitle ? \`<small>• \${escapeHtml(subtitle)}</small>\` : ""}</div>
+        <div class="group">
+          <div class="group-header" data-group="\${gi}">
+            <div>\${escapeHtml(g.city)} <small>• \${g.locations.length} locations</small></div>
+          </div>
+          <div class="group-list">\${locItems}</div>
         </div>
       \`;
     }).join("");
@@ -377,7 +433,13 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     setError("");
     const q = state.query.trim();
     const iso = state.iso.trim().toUpperCase();
-    if (!q) { state.searching = false; return; }
+    if (!q || q.length < 2) {
+      setMeta("Type at least 2 characters.");
+      state.groups = [];
+      renderDropdown();
+      state.searching = false;
+      return;
+    }
 
     if (initial) {
       state.matches = [];
@@ -400,21 +462,20 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
       catch (e) { setError(e.message); break; }
 
       const results = Array.isArray(data.results) ? data.results : [];
-      const matches = results.filter(loc => {
-        const hay = normalize([loc.name, loc.locality, loc.country?.name, loc.country?.code].join(" "));
-        return hay.includes(normalize(q));
-      });
+      const matches = results.filter(loc => matchLocation(loc, q));
 
       state.matches = state.matches.concat(matches);
       page += 1;
       pagesFetched += 1;
 
-      if (state.matches.length >= 10 || results.length === 0) break;
+      if (state.matches.length >= 40 || results.length === 0) break;
     }
 
     state.nextPage = page;
-    if (state.matches.length) {
-      setMeta(\`Found \${state.matches.length} matches. Select a location.\`);
+    state.groups = buildGroups(state.matches);
+
+    if (state.groups.length) {
+      setMeta(\`Found \${state.groups.length} cities. Click a city to compute averages.\`);
       renderDropdown();
     } else {
       setMeta("No matches found in the first pages. Try a more specific name or add country ISO.");
@@ -424,60 +485,129 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     state.searching = false;
   }
 
-  async function loadDataForLocation(loc) {
+  function debounceSearch() {
+    clearTimeout(state.debounceId);
+    state.debounceId = setTimeout(() => {
+      state.query = els.city.value;
+      state.iso = els.iso.value;
+      searchLocations(true);
+    }, 400);
+  }
+
+  async function asyncPool(limit, items, iterator) {
+    const ret = [];
+    const executing = [];
+    for (const item of items) {
+      const p = Promise.resolve().then(() => iterator(item));
+      ret.push(p);
+      if (limit <= items.length) {
+        const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+        executing.push(e);
+        if (executing.length >= limit) await Promise.race(executing);
+      }
+    }
+    return Promise.all(ret);
+  }
+
+  function pickBestPmSensor(sensors) {
+    const pmSensors = sensors.filter(s => {
+      const pname = normalize(s.parameter?.name);
+      const dname = normalize(s.parameter?.displayName);
+      return pname === "pm25" || dname.includes("pm2.5");
+    });
+
+    const withLatest = pmSensors.filter(s => s.latest && s.latest.value != null);
+    if (!withLatest.length) return null;
+
+    // pick the one with most recent datetime
+    withLatest.sort((a, b) => {
+      const da = Date.parse(a.latest?.datetime?.utc || a.latest?.datetime?.local || "") || 0;
+      const db = Date.parse(b.latest?.datetime?.utc || b.latest?.datetime?.local || "") || 0;
+      return db - da;
+    });
+
+    return withLatest[0];
+  }
+
+  async function computeCityAverages(group) {
     setError("");
     els.results.style.display = "block";
-    els.locationMeta.textContent = "Loading…";
     setLoading(true);
 
-    const locationLabel = [loc.name, loc.locality, loc.country?.code].filter(Boolean).join(" • ");
-    els.locationMeta.textContent = locationLabel || "Selected location";
+    const totalLocations = group.locations.length;
+    const locations = group.locations.slice(0, MAX_LOCATIONS);
+    const capped = totalLocations > MAX_LOCATIONS;
+
+    els.locationMeta.textContent = \`City: \${group.city} • Loading \${locations.length}\${capped ? \` (cap \${MAX_LOCATIONS})\` : ""} locations…\`;
 
     try {
-      const sensorsUrl = \`\${API_BASE}/v3/locations/\${loc.id}/sensors?limit=200\`;
-      const sensorsData = await fetchJson(sensorsUrl);
-      const sensors = Array.isArray(sensorsData.results) ? sensorsData.results : [];
-
-      const pmSensors = sensors.filter(s => {
-        const pname = normalize(s.parameter?.name);
-        const dname = normalize(s.parameter?.displayName);
-        return pname === "pm25" || dname.includes("pm2.5");
+      const sensorResults = await asyncPool(CONCURRENCY, locations, async (loc) => {
+        const sensorsUrl = \`\${API_BASE}/v3/locations/\${loc.id}/sensors?limit=200\`;
+        const sensorsData = await fetchJson(sensorsUrl);
+        const sensors = Array.isArray(sensorsData.results) ? sensorsData.results : [];
+        const sensor = pickBestPmSensor(sensors);
+        if (!sensor) return null;
+        return {
+          location: loc,
+          sensor,
+          current: sensor.latest?.value ?? null,
+          updated: sensor.latest?.datetime?.utc || sensor.latest?.datetime?.local || null
+        };
       });
 
-      if (!pmSensors.length) throw new Error("No PM2.5 sensors found for this location.");
+      const used = sensorResults.filter(Boolean).filter(r => r.current != null);
+      const currentMean = used.length ? (used.reduce((s, r) => s + r.current, 0) / used.length) : null;
 
-      let sensor = pmSensors.find(s => s.latest && s.latest.value != null) || pmSensors[0];
-
-      let currentValue = sensor.latest?.value ?? null;
-      let currentUpdated = sensor.latest?.datetime?.utc || sensor.latest?.datetime?.local || null;
-
-      if (currentValue == null) {
-        const measUrl = \`\${API_BASE}/v3/sensors/\${sensor.id}/measurements?limit=1\`;
-        const measData = await fetchJson(measUrl);
-        const meas = Array.isArray(measData.results) ? measData.results[0] : null;
-        currentValue = meas?.value ?? null;
+      let latestUpdate = null;
+      for (const r of used) {
+        const t = Date.parse(r.updated || "");
+        if (!isNaN(t)) {
+          if (!latestUpdate || t > latestUpdate) latestUpdate = t;
+        }
       }
 
-      let annualValue = null;
-      try {
-        const annualUrl = \`\${API_BASE}/v3/sensors/\${sensor.id}/years?date_from=2025-01-01&date_to=2025-12-31&limit=100\`;
-        const annualData = await fetchJson(annualUrl);
-        const annualResults = Array.isArray(annualData.results) ? annualData.results : [];
-        let pick = annualResults.find(r => {
-          const from = r.period?.datetimeFrom?.utc || r.period?.datetimeFrom?.local || "";
-          const to = r.period?.datetimeTo?.utc || r.period?.datetimeTo?.local || "";
-          return String(from).startsWith("2025") || String(to).startsWith("2025");
-        }) || annualResults[0];
+      const annualResults = await asyncPool(CONCURRENCY, used, async (r) => {
+        try {
+          const annualUrl = \`\${API_BASE}/v3/sensors/\${r.sensor.id}/years?date_from=2025-01-01&date_to=2025-12-31&limit=100\`;
+          const annualData = await fetchJson(annualUrl);
+          const annualList = Array.isArray(annualData.results) ? annualData.results : [];
+          const pick = annualList.find(x => {
+            const from = x.period?.datetimeFrom?.utc || x.period?.datetimeFrom?.local || "";
+            const to = x.period?.datetimeTo?.utc || x.period?.datetimeTo?.local || "";
+            return String(from).startsWith("2025") || String(to).startsWith("2025");
+          }) || annualList[0];
+          const val = pick?.value ?? pick?.summary?.avg ?? null;
+          return val != null ? val : null;
+        } catch (e) {
+          return null;
+        }
+      });
 
-        if (pick) annualValue = pick.value ?? pick.summary?.avg ?? null;
-      } catch (e) {
-        annualValue = null;
-      }
+      const annualUsed = annualResults.filter(v => v != null);
+      const annualMean = annualUsed.length ? (annualUsed.reduce((s, v) => s + v, 0) / annualUsed.length) : null;
 
-      renderValues(currentValue, annualValue, currentUpdated);
+      renderValues({
+        city: group.city,
+        currentMean,
+        annualMean,
+        currentCount: used.length,
+        annualCount: annualUsed.length,
+        totalLocations,
+        capped,
+        updated: latestUpdate ? new Date(latestUpdate).toISOString() : null
+      });
     } catch (e) {
       setError(e.message);
-      renderValues(null, null, null);
+      renderValues({
+        city: group.city,
+        currentMean: null,
+        annualMean: null,
+        currentCount: 0,
+        annualCount: 0,
+        totalLocations,
+        capped,
+        updated: null
+      });
     } finally {
       setLoading(false);
     }
@@ -490,17 +620,22 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     });
   }
 
-  function renderValues(current, annual, updated) {
-    animateNumber(els.currentValue, current, "µg/m³");
-    animateNumber(els.annualValue, annual, "µg/m³");
+  function renderValues({ city, currentMean, annualMean, currentCount, annualCount, totalLocations, capped, updated }) {
+    animateNumber(els.currentValue, currentMean, "µg/m³");
+    animateNumber(els.annualValue, annualMean, "µg/m³");
 
-    const cCigs = (current != null) ? Math.round(current / 22) : null;
-    const aCigs = (annual != null) ? Math.round(annual / 22) : null;
+    const cCigs = (currentMean != null) ? Math.round(currentMean / 22) : null;
+    const aCigs = (annualMean != null) ? Math.round(annualMean / 22) : null;
 
     els.currentCigs.textContent = cCigs != null ? \`≈ \${cCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
     els.annualCigs.textContent = aCigs != null ? \`≈ \${aCigs} cigarettes/day\` : "≈ N/A cigarettes/day";
 
-    if (updated) els.locationMeta.textContent = \`\${els.locationMeta.textContent} • Updated \${updated}\`;
+    els.currentCount.textContent = \`\${currentCount} of \${totalLocations} locations used\${capped ? \` (cap \${MAX_LOCATIONS})\` : ""}\`;
+    els.annualCount.textContent = annualCount ? \`\${annualCount} locations with 2025 data\` : "No 2025 data available";
+
+    let meta = \`City: \${city} • Locations used: \${currentCount}/\${totalLocations}\${capped ? \` (cap \${MAX_LOCATIONS})\` : ""}\`;
+    if (updated) meta += \` • Latest update \${updated}\`;
+    els.locationMeta.textContent = meta;
   }
 
   function animateNumber(el, value, unit) {
@@ -519,6 +654,11 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     requestAnimationFrame(tick);
   }
 
+  // Live search
+  els.city.addEventListener("input", debounceSearch);
+  els.iso.addEventListener("input", debounceSearch);
+
+  // Manual search button still works
   els.form.addEventListener("submit", (e) => {
     e.preventDefault();
     state.query = els.city.value;
@@ -526,14 +666,15 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     searchLocations(true);
   });
 
+  // Click city group header to compute averages
   els.dropdown.addEventListener("click", (e) => {
-    const option = e.target.closest(".option");
-    if (!option) return;
-    const idx = Number(option.dataset.idx);
-    const loc = state.matches[idx];
-    if (!loc) return;
+    const header = e.target.closest(".group-header");
+    if (!header) return;
+    const idx = Number(header.dataset.group);
+    const group = state.groups[idx];
+    if (!group) return;
     els.dropdown.style.display = "none";
-    loadDataForLocation(loc);
+    computeCityAverages(group);
   });
 
   document.addEventListener("click", (e) => {
