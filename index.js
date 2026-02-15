@@ -56,7 +56,95 @@ export default {
       return json({ ok: true }, 200, corsHeaders(request));
     }
 
-    // Proxy /v3/*
+    // Aggregate city endpoint (single client request)
+    if (url.pathname === "/city-avg") {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(request) });
+      }
+
+      if (request.method !== "POST") {
+        return json({ error: "Method not allowed" }, 405, corsHeaders(request));
+      }
+
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "Invalid JSON body" }, 400, corsHeaders(request));
+      }
+
+      const city = String(body?.city || "").trim();
+      const country = String(body?.country || "").trim();
+      const locationIds = Array.isArray(body?.locationIds) ? body.locationIds : [];
+
+      if (!city || !country || !locationIds.length) {
+        return json({ error: "Missing city, country, or locationIds" }, 400, corsHeaders(request));
+      }
+
+      if (locationIds.length > 200) {
+        return json({ error: "Too many locations for one request" }, 413, corsHeaders(request));
+      }
+
+      // Cache bucket: 5 minutes
+      const bucket = Math.floor(Date.now() / (5 * 60 * 1000));
+      const cacheKeyUrl = new URL(url.toString());
+      cacheKeyUrl.searchParams.set("city", city);
+      cacheKeyUrl.searchParams.set("country", country);
+      cacheKeyUrl.searchParams.set("bucket", String(bucket));
+      cacheKeyUrl.searchParams.set("locations", locationIds.join(","));
+      const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+
+      const cache = caches.default;
+      const cached = await cache.match(cacheKey);
+      if (cached) return cached;
+
+      const inflightKey = cacheKeyUrl.toString();
+      if (!globalThis.__inflight) globalThis.__inflight = new Map();
+      const inflight = globalThis.__inflight.get(inflightKey);
+      if (inflight) return inflight;
+
+      const promise = (async () => {
+        try {
+          const data = await computeCityAverages(env, locationIds);
+
+          const resp = json(
+            {
+              city,
+              country,
+              ...data,
+              cached: false,
+              computedAt: new Date().toISOString()
+            },
+            200,
+            {
+              ...corsHeaders(request),
+              "cache-control": "public, max-age=300"
+            }
+          );
+
+          ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+          return resp;
+        } catch (e) {
+          const status = e?.status || 500;
+          const retryAfter = e?.retryAfter;
+          const headers = corsHeaders(request);
+          if (retryAfter) headers["Retry-After"] = String(retryAfter);
+
+          return json(
+            { error: e?.message || "Upstream error" },
+            status,
+            headers
+          );
+        } finally {
+          globalThis.__inflight.delete(inflightKey);
+        }
+      })();
+
+      globalThis.__inflight.set(inflightKey, promise);
+      return promise;
+    }
+
+    // Proxy /v3/* (kept for debugging)
     if (url.pathname.startsWith("/v3/")) {
       if (request.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -98,7 +186,7 @@ function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "*";
   return {
     "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS, POST",
     "Access-Control-Allow-Headers": "Content-Type, Accept",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
@@ -113,6 +201,168 @@ function json(obj, status = 200, headers = {}) {
       ...headers
     }
   });
+}
+
+// ==== OpenAQ aggregation (Worker-side) ====
+
+const CONCURRENCY = 3;
+
+async function computeCityAverages(env, locationIds) {
+  const sensorResults = await asyncPool(CONCURRENCY, locationIds, async (locId) => {
+    const sensorsData = await openaqJson(env, `/v3/locations/${locId}/sensors`, { limit: "200" });
+    const sensors = Array.isArray(sensorsData.results) ? sensorsData.results : [];
+    const sensor = pickBestPmSensor(sensors);
+    if (!sensor) return null;
+    return {
+      locationId: locId,
+      sensor,
+      current: sensor.latest?.value ?? null,
+      updated: sensor.latest?.datetime?.utc || sensor.latest?.datetime?.local || null
+    };
+  });
+
+  const used = sensorResults.filter(Boolean).filter(r => r.current != null);
+  const currentMean = used.length ? (used.reduce((s, r) => s + r.current, 0) / used.length) : null;
+
+  let latestUpdate = null;
+  for (const r of used) {
+    const t = Date.parse(r.updated || "");
+    if (!isNaN(t)) {
+      if (!latestUpdate || t > latestUpdate) latestUpdate = t;
+    }
+  }
+
+  const dailyResults = await asyncPool(CONCURRENCY, used, async (r) => {
+    try {
+      return await fetchLast24hMean(env, r.sensor.id);
+    } catch {
+      return null;
+    }
+  });
+  const dailyUsed = dailyResults.filter(v => v != null);
+  const dailyMean = dailyUsed.length ? (dailyUsed.reduce((s, v) => s + v, 0) / dailyUsed.length) : null;
+
+  const lastYear = new Date().getUTCFullYear() - 1;
+  const annualResults = await asyncPool(CONCURRENCY, used, async (r) => {
+    try {
+      return await fetchLastYearMean(env, r.sensor.id, lastYear);
+    } catch {
+      return null;
+    }
+  });
+  const annualUsed = annualResults.filter(v => v != null);
+  const annualMean = annualUsed.length ? (annualUsed.reduce((s, v) => s + v, 0) / annualUsed.length) : null;
+
+  return {
+    currentMean,
+    dailyMean,
+    annualMean,
+    currentCount: used.length,
+    dailyCount: dailyUsed.length,
+    annualCount: annualUsed.length,
+    totalLocations: locationIds.length,
+    updated: latestUpdate ? new Date(latestUpdate).toISOString() : null,
+    lastYear
+  };
+}
+
+function pickBestPmSensor(sensors) {
+  const pmSensors = sensors.filter(s => {
+    const pname = normalize(s.parameter?.name);
+    const dname = normalize(s.parameter?.displayName);
+    return pname === "pm25" || dname.includes("pm2.5");
+  });
+
+  const withLatest = pmSensors.filter(s => s.latest && s.latest.value != null);
+  if (!withLatest.length) return null;
+
+  withLatest.sort((a, b) => {
+    const da = Date.parse(a.latest?.datetime?.utc || a.latest?.datetime?.local || "") || 0;
+    const db = Date.parse(b.latest?.datetime?.utc || b.latest?.datetime?.local || "") || 0;
+    return db - da;
+  });
+
+  return withLatest[0];
+}
+
+async function fetchLast24hMean(env, sensorId) {
+  const now = new Date();
+  const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const params = {
+    date_from: from.toISOString(),
+    date_to: now.toISOString(),
+    limit: "1000",
+    sort: "desc"
+  };
+  const data = await openaqJson(env, `/v3/sensors/${sensorId}/measurements`, params);
+  const results = Array.isArray(data.results) ? data.results : [];
+  if (!results.length) return null;
+
+  const values = results.map(r => r.value).filter(v => v != null && !isNaN(v));
+  if (!values.length) return null;
+
+  return values.reduce((s, v) => s + v, 0) / values.length;
+}
+
+async function fetchLastYearMean(env, sensorId, year) {
+  const params = {
+    date_from: `${year}-01-01`,
+    date_to: `${year}-12-31`,
+    limit: "100"
+  };
+  const data = await openaqJson(env, `/v3/sensors/${sensorId}/years`, params);
+  const list = Array.isArray(data.results) ? data.results : [];
+  const pick = list.find(x => {
+    const from = x.period?.datetimeFrom?.utc || x.period?.datetimeFrom?.local || "";
+    const to = x.period?.datetimeTo?.utc || x.period?.datetimeTo?.local || "";
+    return String(from).startsWith(String(year)) || String(to).startsWith(String(year));
+  }) || list[0];
+  const val = pick?.value ?? pick?.summary?.avg ?? null;
+  return val != null ? val : null;
+}
+
+async function openaqJson(env, path, params = {}) {
+  const url = new URL("https://api.openaq.org" + path);
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== "") url.searchParams.set(k, String(v));
+  }
+
+  const resp = await fetch(url.toString(), {
+    headers: {
+      "accept": "application/json",
+      "X-API-Key": env.OPENAQ_API_KEY
+    }
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    const err = new Error(text || resp.statusText || "Upstream error");
+    err.status = resp.status;
+    const retryAfter = resp.headers.get("Retry-After");
+    if (retryAfter) err.retryAfter = retryAfter;
+    throw err;
+  }
+
+  return resp.json();
+}
+
+async function asyncPool(limit, items, iterator) {
+  const ret = [];
+  const executing = [];
+  for (const item of items) {
+    const p = Promise.resolve().then(() => iterator(item));
+    ret.push(p);
+    if (limit <= items.length) {
+      const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+      executing.push(e);
+      if (executing.length >= limit) await Promise.race(executing);
+    }
+  }
+  return Promise.all(ret);
+}
+
+function normalize(s) {
+  return (s || "").toLowerCase();
 }
 
 // === HTML ===
@@ -360,6 +610,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 (() => {
   const API_BASE = location.origin; // same Worker origin
   const CITIES_URL = "/cities.json";
+  const CITY_AVG_URL = "/city-avg";
 
   const els = {
     form: document.getElementById("searchForm"),
@@ -383,27 +634,29 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     annualLabel: document.getElementById("annualLabel")
   };
 
-  const CONCURRENCY = 5;
-
   const state = {
     cities: [],
     filtered: [],
     query: "",
     iso: "",
-    searching: false,
     debounceId: null,
-    citiesReady: false
+    citiesReady: false,
+    inFlight: null,
+    cache: new Map()
   };
 
   function setError(msg) { els.errorBox.textContent = msg || ""; }
   function setMeta(msg) { els.searchMeta.textContent = msg || ""; }
   function normalize(s) { return (s || "").toLowerCase(); }
 
-  async function fetchJson(url) {
-    const res = await fetch(url, { headers: { "accept": "application/json" } });
+  async function fetchJson(url, opts = {}) {
+    const res = await fetch(url, { headers: { "accept": "application/json" }, ...opts });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(\`API \${res.status}: \${text || res.statusText}\`);
+      const err = new Error(\`API \${res.status}: \${text || res.statusText}\`);
+      err.status = res.status;
+      err.retryAfter = res.headers.get("Retry-After");
+      throw err;
     }
     return res.json();
   }
@@ -439,7 +692,6 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
       list = list.filter(c => normalize(c.country_code) === iso);
     }
 
-    // Limit dropdown to 50 entries for UX
     state.filtered = list.slice(0, 50);
 
     if (state.filtered.length) {
@@ -478,76 +730,9 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     }, 250);
   }
 
-  async function asyncPool(limit, items, iterator) {
-    const ret = [];
-    const executing = [];
-    for (const item of items) {
-      const p = Promise.resolve().then(() => iterator(item));
-      ret.push(p);
-      if (limit <= items.length) {
-        const e = p.then(() => executing.splice(executing.indexOf(e), 1));
-        executing.push(e);
-        if (executing.length >= limit) await Promise.race(executing);
-      }
-    }
-    return Promise.all(ret);
-  }
-
-  function pickBestPmSensor(sensors) {
-    const pmSensors = sensors.filter(s => {
-      const pname = normalize(s.parameter?.name);
-      const dname = normalize(s.parameter?.displayName);
-      return pname === "pm25" || dname.includes("pm2.5");
-    });
-
-    const withLatest = pmSensors.filter(s => s.latest && s.latest.value != null);
-    if (!withLatest.length) return null;
-
-    withLatest.sort((a, b) => {
-      const da = Date.parse(a.latest?.datetime?.utc || a.latest?.datetime?.local || "") || 0;
-      const db = Date.parse(b.latest?.datetime?.utc || b.latest?.datetime?.local || "") || 0;
-      return db - da;
-    });
-
-    return withLatest[0];
-  }
-
-  async function fetchLast24hMean(sensorId) {
-    const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const params = new URLSearchParams({
-      date_from: from.toISOString(),
-      date_to: now.toISOString(),
-      limit: "1000",
-      sort: "desc"
-    });
-    const url = \`\${API_BASE}/v3/sensors/\${sensorId}/measurements?\${params}\`;
-    const data = await fetchJson(url);
-    const results = Array.isArray(data.results) ? data.results : [];
-    if (!results.length) return null;
-
-    const values = results.map(r => r.value).filter(v => v != null && !isNaN(v));
-    if (!values.length) return null;
-
-    return values.reduce((s, v) => s + v, 0) / values.length;
-  }
-
-  async function fetchLastYearMean(sensorId, year) {
-    const params = new URLSearchParams({
-      date_from: \`\${year}-01-01\`,
-      date_to: \`\${year}-12-31\`,
-      limit: "100"
-    });
-    const url = \`\${API_BASE}/v3/sensors/\${sensorId}/years?\${params}\`;
-    const data = await fetchJson(url);
-    const list = Array.isArray(data.results) ? data.results : [];
-    const pick = list.find(x => {
-      const from = x.period?.datetimeFrom?.utc || x.period?.datetimeFrom?.local || "";
-      const to = x.period?.datetimeTo?.utc || x.period?.datetimeTo?.local || "";
-      return String(from).startsWith(String(year)) || String(to).startsWith(String(year));
-    }) || list[0];
-    const val = pick?.value ?? pick?.summary?.avg ?? null;
-    return val != null ? val : null;
+  function cacheKeyForCity(cityObj) {
+    const ids = (cityObj.locations || []).map(l => l.id).join(",");
+    return \`\${cityObj.city}|\${cityObj.country}|\${ids}\`;
   }
 
   async function computeCityAverages(cityObj) {
@@ -558,69 +743,46 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     const totalLocations = cityObj.locations.length;
     els.locationMeta.textContent = \`City: \${cityObj.city}, \${cityObj.country} • Loading \${totalLocations} locations…\`;
 
+    const key = cacheKeyForCity(cityObj);
+    const cached = state.cache.get(key);
+    if (cached && cached.expires > Date.now()) {
+      renderValues({ ...cached.data, city: cityObj.city, country: cityObj.country, totalLocations, cached: true });
+      setLoading(false);
+      return;
+    }
+
+    if (state.inFlight) {
+      state.inFlight.abort();
+      state.inFlight = null;
+    }
+    const controller = new AbortController();
+    state.inFlight = controller;
+
     try {
-      const sensorResults = await asyncPool(CONCURRENCY, cityObj.locations, async (loc) => {
-        const sensorsUrl = \`\${API_BASE}/v3/locations/\${loc.id}/sensors?limit=200\`;
-        const sensorsData = await fetchJson(sensorsUrl);
-        const sensors = Array.isArray(sensorsData.results) ? sensorsData.results : [];
-        const sensor = pickBestPmSensor(sensors);
-        if (!sensor) return null;
-        return {
-          location: loc,
-          sensor,
-          current: sensor.latest?.value ?? null,
-          updated: sensor.latest?.datetime?.utc || sensor.latest?.datetime?.local || null
-        };
-      });
-
-      const used = sensorResults.filter(Boolean).filter(r => r.current != null);
-      const currentMean = used.length ? (used.reduce((s, r) => s + r.current, 0) / used.length) : null;
-
-      let latestUpdate = null;
-      for (const r of used) {
-        const t = Date.parse(r.updated || "");
-        if (!isNaN(t)) {
-          if (!latestUpdate || t > latestUpdate) latestUpdate = t;
-        }
-      }
-
-      const dailyResults = await asyncPool(CONCURRENCY, used, async (r) => {
-        try {
-          return await fetchLast24hMean(r.sensor.id);
-        } catch (e) {
-          return null;
-        }
-      });
-      const dailyUsed = dailyResults.filter(v => v != null);
-      const dailyMean = dailyUsed.length ? (dailyUsed.reduce((s, v) => s + v, 0) / dailyUsed.length) : null;
-
-      const lastYear = new Date().getUTCFullYear() - 1;
-      els.annualLabel.textContent = \`Average PM2.5 (\${lastYear})\`;
-
-      const annualResults = await asyncPool(CONCURRENCY, used, async (r) => {
-        try {
-          return await fetchLastYearMean(r.sensor.id, lastYear);
-        } catch (e) {
-          return null;
-        }
-      });
-      const annualUsed = annualResults.filter(v => v != null);
-      const annualMean = annualUsed.length ? (annualUsed.reduce((s, v) => s + v, 0) / annualUsed.length) : null;
-
-      renderValues({
+      const payload = {
         city: cityObj.city,
         country: cityObj.country,
-        currentMean,
-        dailyMean,
-        annualMean,
-        currentCount: used.length,
-        dailyCount: dailyUsed.length,
-        annualCount: annualUsed.length,
-        totalLocations,
-        updated: latestUpdate ? new Date(latestUpdate).toISOString() : null
+        locationIds: cityObj.locations.map(l => l.id)
+      };
+
+      const data = await fetchJson(CITY_AVG_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
       });
+
+      renderValues({ ...data, city: cityObj.city, country: cityObj.country, totalLocations });
+      state.cache.set(key, { data, expires: Date.now() + 5 * 60 * 1000 });
     } catch (e) {
-      setError(e.message);
+      if (e.name === "AbortError") return;
+      if (e.status === 429) {
+        const wait = e.retryAfter ? \` Try again in \${e.retryAfter} seconds.\` : " Try again in a minute.";
+        setError("OpenAQ rate limit hit." + wait);
+      } else {
+        setError(e.message);
+      }
+
       renderValues({
         city: cityObj.city,
         country: cityObj.country,
@@ -631,10 +793,12 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
         dailyCount: 0,
         annualCount: 0,
         totalLocations,
-        updated: null
+        updated: null,
+        lastYear: new Date().getUTCFullYear() - 1
       });
     } finally {
       setLoading(false);
+      state.inFlight = null;
     }
   }
 
@@ -645,7 +809,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     });
   }
 
-  function renderValues({ city, country, currentMean, dailyMean, annualMean, currentCount, dailyCount, annualCount, totalLocations, updated }) {
+  function renderValues({ city, country, currentMean, dailyMean, annualMean, currentCount, dailyCount, annualCount, totalLocations, updated, lastYear, cached, computedAt }) {
     animateNumber(els.currentValue, currentMean, "µg/m³");
     animateNumber(els.dailyValue, dailyMean, "µg/m³");
     animateNumber(els.annualValue, annualMean, "µg/m³");
@@ -662,8 +826,13 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     els.dailyCount.textContent = dailyCount ? \`\${dailyCount} locations with 24h data\` : "No 24h data available";
     els.annualCount.textContent = annualCount ? \`\${annualCount} locations with last-year data\` : "No last-year data available";
 
+    const year = lastYear || (new Date().getUTCFullYear() - 1);
+    els.annualLabel.textContent = \`Average PM2.5 (\${year})\`;
+
     let meta = \`City: \${city}, \${country} • Locations used: \${currentCount}/\${totalLocations}\`;
     if (updated) meta += \` • Latest update \${updated}\`;
+    if (computedAt) meta += \` • Computed \${computedAt}\`;
+    if (cached) meta += " • Cached";
     els.locationMeta.textContent = meta;
   }
 
