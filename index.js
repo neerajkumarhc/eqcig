@@ -211,7 +211,7 @@ function json(obj, status = 200, headers = {}) {
 // ==== OpenAQ aggregation (Worker-side) ====
 
 const CONCURRENCY = 3;
-const BATCH_SIZE = 200;
+const BATCH_SIZE = 100;
 const MAX_LOCATIONS = 2000;
 
 async function computeCityAveragesBatched(env, locationIds) {
@@ -955,3 +955,4 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 })();
 </script>
 </body></html>`;
+
