@@ -92,8 +92,6 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     --accent: #7c9cff;
     --accent-2: #9ef0ff;
     --border: #1f2937;
-    --good: #22c55e;
-    --warn: #f59e0b;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -283,7 +281,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
           <label for="cityInput">City name</label>
           <input id="cityInput" type="text" placeholder="e.g., London" required="">
           <div id="dropdown" class="dropdown" style="display:none;"></div>
-          <div class="hint">Live search (debounced). Click a city to compute averages. Locations listed under each city.</div>
+          <div class="hint">Live search (debounced). City is parsed from location name (after first comma).</div>
         </div>
         <div class="field">
           <label for="isoInput">Country ISO (optional)</label>
@@ -366,6 +364,7 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     return res.json();
   }
 
+  // City is ONLY the substring after the first comma in location.name
   function parseCityFromName(name) {
     if (!name) return "";
     const parts = String(name).split(",");
@@ -375,15 +374,13 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
 
   function matchLocation(loc, q) {
     const query = normalize(q);
-    const locality = normalize(loc.locality || "");
-    const name = normalize(loc.name || "");
     const parsedCity = normalize(parseCityFromName(loc.name || ""));
-    if (locality) return locality.includes(query);
-    return name.includes(query) || parsedCity.includes(query);
+    if (!parsedCity) return false;
+    return parsedCity.includes(query);
   }
 
   function cityKeyForLocation(loc) {
-    return (loc.locality || parseCityFromName(loc.name) || "Unknown").trim();
+    return (parseCityFromName(loc.name) || "Unknown").trim();
   }
 
   function buildGroups(locations) {
@@ -404,10 +401,9 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     els.dropdown.innerHTML = groups.map((g, gi) => {
       const locItems = g.locations.map(loc => {
         const name = loc.name || "Unnamed location";
-        const locality = loc.locality || "";
         const country = loc.country?.code || loc.country?.name || "";
-        const subtitle = [locality, country].filter(Boolean).join(", ");
-        return \`<div class="location-item">\${escapeHtml(name)}\${subtitle ? \` <small>• \${escapeHtml(subtitle)}</small>\` : ""}</div>\`;
+        const subtitle = country ? \` • \${country}\` : "";
+        return \`<div class="location-item">\${escapeHtml(name)}\${subtitle ? \` <small>\${escapeHtml(subtitle)}</small>\` : ""}</div>\`;
       }).join("");
       return \`
         <div class="group">
@@ -519,7 +515,6 @@ const HTML = `<!DOCTYPE html><html lang="en"><head><meta name="x-poe-datastore-b
     const withLatest = pmSensors.filter(s => s.latest && s.latest.value != null);
     if (!withLatest.length) return null;
 
-    // pick the one with most recent datetime
     withLatest.sort((a, b) => {
       const da = Date.parse(a.latest?.datetime?.utc || a.latest?.datetime?.local || "") || 0;
       const db = Date.parse(b.latest?.datetime?.utc || b.latest?.datetime?.local || "") || 0;
